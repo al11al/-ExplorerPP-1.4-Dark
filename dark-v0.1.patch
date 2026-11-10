@@ -472,7 +472,7 @@ index d62cb32..6047822 100644
 +		if (font) { DeleteObject(font); }
 +		ReleaseDC(hwnd, dc);
 +		item->itemWidth = size.cx + 16;
-+		item->itemHeight = std::max(size.cy + 6, GetSystemMetrics(SM_CYMENU) - 2);
++		item->itemHeight = (size.cy + 6 > GetSystemMetrics(SM_CYMENU) - 2) ? (size.cy + 6) : (GetSystemMetrics(SM_CYMENU) - 2);
 +		return TRUE;
 +	}
 +	case WM_DRAWITEM:
