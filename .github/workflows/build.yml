@@ -1,0 +1,99 @@
+name: Explorer++ 1.4 dark prototype (x64)
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 40
+    steps:
+      - name: Get small build instructions repository
+        uses: actions/checkout@v4
+        with:
+          path: instructions
+          persist-credentials: false
+
+      - name: Get unmodified official Explorer++ 1.4.0 source
+        uses: actions/checkout@v4
+        with:
+          repository: derceg/explorerplusplus
+          ref: version-1.4.0
+          path: upstream
+          persist-credentials: false
+
+      - name: Check and apply isolated dark appearance patch
+        shell: pwsh
+        run: |
+          Push-Location upstream
+          try {
+            git apply --check ../instructions/dark-v0.1.patch
+            if ($LASTEXITCODE -ne 0) { throw 'Patch did not match the official Explorer++ 1.4.0 source' }
+            git apply ../instructions/dark-v0.1.patch
+            if ($LASTEXITCODE -ne 0) { throw 'Patch application failed' }
+            git diff --stat
+          } finally { Pop-Location }
+
+      - name: Locate MSBuild (v142 C++ compiler preinstalled)
+        uses: microsoft/setup-msbuild@v2
+
+      - name: Restore upstream NuGet packages
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build-logs | Out-Null
+          & nuget restore 'upstream/Explorer++/Explorer++.sln' -NonInteractive -Verbosity normal *>&1 |
+            Tee-Object -FilePath build-logs/nuget-restore.log
+          if ($LASTEXITCODE -ne 0) { throw 'NuGet restore failed; inspect nuget-restore.log' }
+
+      - name: Compile ONLY the Explorer++ portable program, Release x64
+        shell: pwsh
+        run: |
+          & msbuild 'upstream/Explorer++/Explorer++/Explorer++.vcxproj' `
+            '/m' '/nologo' '/verbosity:minimal' '/p:Configuration=Release;Platform=x64;PlatformToolset=v142' `
+            '/p:WindowsTargetPlatformVersion=10.0.22621.0' *>&1 |
+            Tee-Object -FilePath build-logs/msbuild.log
+          if ($LASTEXITCODE -ne 0) { throw 'Compilation failed; inspect msbuild.log' }
+
+      - name: Package for isolated TEST ONLY
+        shell: pwsh
+        run: |
+          $exe = 'upstream/Explorer++/Explorer++/x64/Release/Explorer++.exe'
+          if (-not (Test-Path -LiteralPath $exe)) {
+            $found = Get-ChildItem upstream -Recurse -Filter 'Explorer++.exe' -File | Select-Object -First 1
+            if (-not $found) { throw 'Build reported success, but Explorer++.exe not found' }
+            $exe = $found.FullName
+          }
+          New-Item -ItemType Directory -Force test-copy | Out-Null
+          Copy-Item -LiteralPath $exe -Destination 'test-copy/Explorer++.exe'
+          @'
+          EXPLORER++ 1.4.0 - DARK APPEARANCE EXPERIMENT v0.1
+          NOT a stable release. NOT tested interactively on Windows.
+          Run separately from the existing working Explorer++.
+          Do not register as default file manager. Do not use for important copy/move operations.
+          Keep configuration separate. Only test appearance and basic navigation initially.
+          Based on original GPL-3.0 source: derceg/explorerplusplus tag version-1.4.0.
+          See source code and LICENSE in the upstream repository.
+          '@ | Set-Content -Path 'test-copy/READ_ME_FIRST.txt' -Encoding UTF8
+          Compress-Archive -Path 'test-copy/*' -DestinationPath 'ExplorerPP_1_4_Dark_TEST_ONLY.zip' -Force
+
+      - name: Upload EXE if built
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ExplorerPP_1_4_Dark_TEST_ONLY
+          path: ExplorerPP_1_4_Dark_TEST_ONLY.zip
+          retention-days: 7
+
+      - name: Upload diagnostic logs even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-diagnostics
+          path: build-logs/
+          if-no-files-found: ignore
+          retention-days: 7
