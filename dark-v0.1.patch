@@ -1,8 +1,8 @@
 diff --git a/Explorer++/Explorer++/UiTheming.cpp b/Explorer++/Explorer++/UiTheming.cpp
-index d62cb32..f6360c6 100644
+index d62cb32..6047822 100644
 --- a/Explorer++/Explorer++/UiTheming.cpp
 +++ b/Explorer++/Explorer++/UiTheming.cpp
-@@ -1,82 +1,359 @@
+@@ -1,82 +1,466 @@
 -// Copyright (C) Explorer++ Project
 -// SPDX-License-Identifier: GPL-3.0-only
 -// See LICENSE in the top level directory
@@ -93,6 +93,7 @@ index d62cb32..f6360c6 100644
 +#include "stdafx.h"
 +#include "UiTheming.h"
 +#include "CoreInterface.h"
++#include "DisplayWindow/DisplayWindow.h"
 +#include "ShellBrowser/ShellBrowser.h"
 +#include "Tab.h"
 +#include "TabContainer.h"
@@ -124,6 +125,10 @@ index d62cb32..f6360c6 100644
 +	if (m_darkBackgroundBrush)
 +	{
 +		DeleteObject(m_darkBackgroundBrush);
++	}
++	if (m_darkHoverBrush)
++	{
++		DeleteObject(m_darkHoverBrush);
 +	}
 +}
 +
@@ -210,6 +215,8 @@ index d62cb32..f6360c6 100644
 +// runtime and degrade gracefully when they aren't present.  They are used by
 +// Explorer++ 1.5 too, but no source from that version is copied here.
 +using SetPreferredAppModeFn = int (WINAPI *)(int);
++using FlushMenuThemesFn = void (WINAPI *)();
++using RefreshImmersiveColorPolicyStateFn = void (WINAPI *)();
 +using AllowDarkModeForWindowFn = bool (WINAPI *)(HWND, bool);
 +AllowDarkModeForWindowFn g_allowDarkModeForWindow = nullptr;
 +
@@ -254,10 +261,22 @@ index d62cb32..f6360c6 100644
 +		GetProcAddress(uxTheme, MAKEINTRESOURCEA(135)));
 +	g_allowDarkModeForWindow = reinterpret_cast<AllowDarkModeForWindowFn>(
 +		GetProcAddress(uxTheme, MAKEINTRESOURCEA(133)));
++	auto flushMenuThemes = reinterpret_cast<FlushMenuThemesFn>(
++		GetProcAddress(uxTheme, MAKEINTRESOURCEA(136)));
++	auto refreshPolicy = reinterpret_cast<RefreshImmersiveColorPolicyStateFn>(
++		GetProcAddress(uxTheme, MAKEINTRESOURCEA(104)));
 +	if (setPreferredAppMode)
 +	{
 +		// 2 == ForceDark on Windows 10 1903+; this changes the current process only.
 +		setPreferredAppMode(2);
++	}
++	if (flushMenuThemes)
++	{
++		flushMenuThemes();
++	}
++	if (refreshPolicy)
++	{
++		refreshPolicy();
 +	}
 +}
 +
@@ -276,6 +295,7 @@ index d62cb32..f6360c6 100644
 +	}
 +
 +	m_darkBackgroundBrush = CreateSolidBrush(DARK_BACKGROUND);
++	m_darkHoverBrush = CreateSolidBrush(DARK_HOVER);
 +	if (!m_darkBackgroundBrush)
 +	{
 +		return;
@@ -292,6 +312,37 @@ index d62cb32..f6360c6 100644
 +			&dark, sizeof(dark));
 +		ApplyDarkAppearanceToWindow(mainWindow);
 +		EnumChildWindows(mainWindow, EnumChildThemeProc, reinterpret_cast<LPARAM>(this));
++
++		// Only the top-level menu bar is owner-drawn. Dropdown menus remain
++		// native so keyboard navigation, accessibility and shell extensions
++		// are not reimplemented. The process dark mode request above asks
++		// Windows itself to render the dropdowns dark where supported.
++		HMENU mainMenu = GetMenu(mainWindow);
++		if (mainMenu)
++		{
++			const int count = GetMenuItemCount(mainMenu);
++			for (int index = 0; index < count; ++index)
++			{
++				MENUITEMINFOW item = {};
++				item.cbSize = sizeof(item);
++				item.fMask = MIIM_FTYPE;
++				if (!GetMenuItemInfoW(mainMenu, index, TRUE, &item))
++				{
++					continue;
++				}
++				item.fMask = MIIM_FTYPE | MIIM_DATA;
++				item.fType |= MFT_OWNERDRAW;
++				item.dwItemData = static_cast<ULONG_PTR>(index);
++				SetMenuItemInfoW(mainMenu, index, TRUE, &item);
++			}
++			MENUINFO menuInfo = {};
++			menuInfo.cbSize = sizeof(menuInfo);
++			menuInfo.fMask = MIM_BACKGROUND;
++			menuInfo.hbrBack = m_darkBackgroundBrush;
++			SetMenuInfo(mainMenu, &menuInfo);
++			DrawMenuBar(mainWindow);
++		}
++
 +	}
 +
 +	SetListViewColors(DARK_BACKGROUND, DARK_FOREGROUND);
@@ -374,6 +425,14 @@ index d62cb32..f6360c6 100644
 +	{
 +		SetWindowTheme(hwnd, L"CFD", nullptr);
 +	}
++	else if (IsClass(hwnd, L"DisplayWindow"))
++	{
++		// The classic information pane paints its own blue gradient. These
++		// existing messages ask it to render dark without changing its logic.
++		SendMessage(hwnd, DWM_SETCENTRECOLOR, DARK_PANEL, 0);
++		SendMessage(hwnd, DWM_SETSURROUNDCOLOR, DARK_BACKGROUND, 0);
++		DisplayWindow_SetTextColor(hwnd, DARK_FOREGROUND);
++	}
 +
 +	// Style parent-held backgrounds, labels, and toolbar custom draw without
 +	// subclassing any filesystem-related operations.
@@ -388,6 +447,54 @@ index d62cb32..f6360c6 100644
 +
 +	switch (msg)
 +	{
++	case WM_MEASUREITEM:
++	{
++		if (hwnd != self->m_expp->GetMainWindow()) { break; }
++		auto *item = reinterpret_cast<MEASUREITEMSTRUCT *>(lParam);
++		if (!item || item->CtlType != ODT_MENU) { break; }
++		HMENU menu = GetMenu(hwnd);
++		if (!menu || item->itemData >= static_cast<ULONG_PTR>(GetMenuItemCount(menu))) { break; }
++		WCHAR text[256] = {};
++		GetMenuStringW(menu, static_cast<UINT>(item->itemData), text, 256, MF_BYPOSITION);
++		HDC dc = GetDC(hwnd);
++		if (!dc) { break; }
++		NONCLIENTMETRICSW metrics = {};
++		metrics.cbSize = sizeof(metrics);
++		HFONT font = nullptr;
++		if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
++		{
++			font = CreateFontIndirectW(&metrics.lfMenuFont);
++		}
++		HGDIOBJ previousFont = font ? SelectObject(dc, font) : nullptr;
++		SIZE size = {};
++		GetTextExtentPoint32W(dc, text, lstrlenW(text), &size);
++		if (previousFont) { SelectObject(dc, previousFont); }
++		if (font) { DeleteObject(font); }
++		ReleaseDC(hwnd, dc);
++		item->itemWidth = size.cx + 16;
++		item->itemHeight = std::max(size.cy + 6, GetSystemMetrics(SM_CYMENU) - 2);
++		return TRUE;
++	}
++	case WM_DRAWITEM:
++	{
++		if (hwnd != self->m_expp->GetMainWindow()) { break; }
++		auto *item = reinterpret_cast<DRAWITEMSTRUCT *>(lParam);
++		if (!item || item->CtlType != ODT_MENU) { break; }
++		HMENU menu = GetMenu(hwnd);
++		if (!menu || item->itemData >= static_cast<ULONG_PTR>(GetMenuItemCount(menu))) { break; }
++		WCHAR text[256] = {};
++		GetMenuStringW(menu, static_cast<UINT>(item->itemData), text, 256, MF_BYPOSITION);
++		const bool highlighted = (item->itemState & (ODS_SELECTED | ODS_HOTLIGHT)) != 0;
++		FillRect(item->hDC, &item->rcItem,
++			highlighted && self->m_darkHoverBrush ? self->m_darkHoverBrush : self->m_darkBackgroundBrush);
++		SetBkMode(item->hDC, TRANSPARENT);
++		SetTextColor(item->hDC, (item->itemState & (ODS_DISABLED | ODS_GRAYED))
++			? RGB(135, 135, 135) : DARK_FOREGROUND);
++		UINT flags = DT_CENTER | DT_VCENTER | DT_SINGLELINE;
++		if (item->itemState & ODS_NOACCEL) { flags |= DT_HIDEPREFIX; }
++		DrawTextW(item->hDC, text, -1, &item->rcItem, flags);
++		return TRUE;
++	}
 +	case WM_CTLCOLORSTATIC:
 +	case WM_CTLCOLORBTN:
 +	case WM_CTLCOLOREDIT:
@@ -446,10 +553,10 @@ index d62cb32..f6360c6 100644
 +	return DefSubclassProc(hwnd, msg, wParam, lParam);
 +}
 diff --git a/Explorer++/Explorer++/UiTheming.h b/Explorer++/Explorer++/UiTheming.h
-index 5f56242..15871fb 100644
+index 5f56242..3dd6cd5 100644
 --- a/Explorer++/Explorer++/UiTheming.h
 +++ b/Explorer++/Explorer++/UiTheming.h
-@@ -1,37 +1,49 @@
+@@ -1,37 +1,50 @@
 -// Copyright (C) Explorer++ Project
 -// SPDX-License-Identifier: GPL-3.0-only
 -// See LICENSE in the top level directory
@@ -533,6 +640,7 @@ index 5f56242..15871fb 100644
 +	COLORREF m_listViewTextColor;
 +
 +	HBRUSH m_darkBackgroundBrush = nullptr;
++	HBRUSH m_darkHoverBrush = nullptr;
 +	std::vector<HWND> m_themeWindows;
  };
 \ No newline at end of file
