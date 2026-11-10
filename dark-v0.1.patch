@@ -1,8 +1,8 @@
 diff --git a/Explorer++/Explorer++/UiTheming.cpp b/Explorer++/Explorer++/UiTheming.cpp
-index d62cb32..6047822 100644
+index d62cb32..c2e62e1 100644
 --- a/Explorer++/Explorer++/UiTheming.cpp
 +++ b/Explorer++/Explorer++/UiTheming.cpp
-@@ -1,82 +1,466 @@
+@@ -1,82 +1,777 @@
 -// Copyright (C) Explorer++ Project
 -// SPDX-License-Identifier: GPL-3.0-only
 -// See LICENSE in the top level directory
@@ -101,6 +101,11 @@ index d62cb32..6047822 100644
 +#include <dwmapi.h>
 +#include <uxtheme.h>
 +
++namespace
++{
++UiTheming *g_currentDarkTheming = nullptr;
++}
++
 +UiTheming::UiTheming(IExplorerplusplus *expp, TabContainer *tabContainer) :
 +	m_expp(expp),
 +	m_tabContainer(tabContainer),
@@ -113,6 +118,16 @@ index d62cb32..6047822 100644
 +
 +UiTheming::~UiTheming()
 +{
++	// Unhook before destroying any window subclass or brushes.
++	if (m_dialogHook)
++	{
++		UnhookWindowsHookEx(m_dialogHook);
++		m_dialogHook = nullptr;
++	}
++	if (g_currentDarkTheming == this)
++	{
++		g_currentDarkTheming = nullptr;
++	}
 +	// Window subclasses must not retain a pointer to a destroyed UiTheming instance.
 +	for (HWND hwnd : m_themeWindows)
 +	{
@@ -210,6 +225,12 @@ index d62cb32..6047822 100644
 +constexpr COLORREF DARK_PANEL = RGB(44, 44, 44);
 +constexpr COLORREF DARK_FOREGROUND = RGB(233, 233, 233);
 +constexpr COLORREF DARK_HOVER = RGB(61, 61, 61);
++constexpr COLORREF DARK_ACTIVE_TAB = RGB(52, 57, 64);
++constexpr COLORREF DARK_BORDER = RGB(75, 75, 75);
++constexpr COLORREF DARK_MUTED = RGB(145, 145, 145);
++constexpr COLORREF DARK_ACCENT = RGB(40, 139, 228);
++
++// The CBT hook is scoped to Explorer++'s own UI thread, not the whole system.
 +
 +// On Windows 10 1903+ these are undocumented uxtheme exports.  Resolve at
 +// runtime and degrade gracefully when they aren't present.  They are used by
@@ -347,6 +368,20 @@ index d62cb32..6047822 100644
 +
 +	SetListViewColors(DARK_BACKGROUND, DARK_FOREGROUND);
 +	SetTreeViewColors(DARK_BACKGROUND, DARK_FOREGROUND);
++
++	// Standard and modeless Explorer++ dialogs are created later.  Activate/focus
++	// notifications let us theme them without changing any dialog procedures.
++	// Hook only the thread that owns the Explorer++ main window.
++	if (mainWindow && !g_currentDarkTheming)
++	{
++		g_currentDarkTheming = this;
++		m_dialogHook = SetWindowsHookExW(WH_CBT, DialogCbtHook, nullptr,
++			GetWindowThreadProcessId(mainWindow, nullptr));
++		if (!m_dialogHook)
++		{
++			g_currentDarkTheming = nullptr;
++		}
++	}
 +}
 +
 +BOOL CALLBACK UiTheming::EnumChildThemeProc(HWND hwnd, LPARAM data)
@@ -354,6 +389,124 @@ index d62cb32..6047822 100644
 +	auto *self = reinterpret_cast<UiTheming *>(data);
 +	self->ApplyDarkAppearanceToWindow(hwnd);
 +	return TRUE;
++}
++
++LRESULT CALLBACK UiTheming::DialogCbtHook(int code, WPARAM wParam, LPARAM lParam)
++{
++	UNREFERENCED_PARAMETER(lParam);
++	UiTheming *self = g_currentDarkTheming;
++	if (self && (code == HCBT_ACTIVATE || code == HCBT_SETFOCUS))
++	{
++		HWND focused = reinterpret_cast<HWND>(wParam);
++		HWND root = focused ? GetAncestor(focused, GA_ROOT) : nullptr;
++		HWND main = self->m_expp->GetMainWindow();
++		if (root && root != main && IsWindow(root) && IsClass(root, L"#32770"))
++		{
++			// Only windows owned (directly or indirectly) by our own main window.
++			// Leave external shell windows and other processes completely untouched.
++			HWND owner = GetWindow(root, GW_OWNER);
++			while (owner && owner != main)
++			{
++				owner = GetWindow(owner, GW_OWNER);
++			}
++			if (owner == main)
++			{
++				self->ThemeOwnedDialog(root);
++			}
++		}
++	}
++	return CallNextHookEx(self ? self->m_dialogHook : nullptr, code, wParam, lParam);
++}
++
++void UiTheming::ThemeOwnedDialog(HWND hwnd)
++{
++	if (!hwnd || m_inThemeTraversal)
++	{
++		return;
++	}
++	m_inThemeTraversal = true;
++	bool firstVisit = std::find(m_themeWindows.begin(), m_themeWindows.end(), hwnd)
++		== m_themeWindows.end();
++	BOOL dark = TRUE;
++	DwmSetWindowAttribute(hwnd, static_cast<DWMWINDOWATTRIBUTE>(20), &dark, sizeof(dark));
++	ApplyDarkAppearanceToWindow(hwnd);
++	EnumChildWindows(hwnd, EnumChildThemeProc, reinterpret_cast<LPARAM>(this));
++	if (firstVisit)
++	{
++		RedrawWindow(hwnd, nullptr, nullptr, RDW_INVALIDATE | RDW_ALLCHILDREN);
++	}
++	m_inThemeTraversal = false;
++}
++
++void UiTheming::PaintDarkTabs(HWND hwnd, HDC dc)
++{
++	RECT client = {};
++	GetClientRect(hwnd, &client);
++	FillRect(dc, &client, m_darkBackgroundBrush);
++
++	HGDIOBJ oldFont = nullptr;
++	HFONT font = reinterpret_cast<HFONT>(SendMessage(hwnd, WM_GETFONT, 0, 0));
++	if (font)
++	{
++		oldFont = SelectObject(dc, font);
++	}
++	SetBkMode(dc, TRANSPARENT);
++	HIMAGELIST images = TabCtrl_GetImageList(hwnd);
++	const int selected = TabCtrl_GetCurSel(hwnd);
++	const int count = TabCtrl_GetItemCount(hwnd);
++
++	for (int i = 0; i < count; ++i)
++	{
++		RECT tabRect = {};
++		if (!TabCtrl_GetItemRect(hwnd, i, &tabRect))
++		{
++			continue;
++		}
++		WCHAR title[260] = {};
++		TCITEMW tab = {};
++		tab.mask = TCIF_TEXT | TCIF_IMAGE;
++		tab.pszText = title;
++		tab.cchTextMax = static_cast<int>(_countof(title));
++		tab.iImage = -1;
++		TabCtrl_GetItem(hwnd, i, &tab);
++		const bool active = i == selected;
++		const bool hover = i == m_hoverTabIndex;
++		HBRUSH fill = CreateSolidBrush(active ? DARK_ACTIVE_TAB
++			: (hover ? DARK_HOVER : DARK_PANEL));
++		FillRect(dc, &tabRect, fill);
++		DeleteObject(fill);
++		FrameRect(dc, &tabRect, m_darkHoverBrush);
++
++		if (active)
++		{
++			RECT accent = { tabRect.left + 1, tabRect.top + 1,
++				tabRect.right - 1, tabRect.top + 3 };
++			HBRUSH accentBrush = CreateSolidBrush(DARK_ACCENT);
++			FillRect(dc, &accent, accentBrush);
++			DeleteObject(accentBrush);
++		}
++
++		RECT label = tabRect;
++		label.left += 10;
++		label.right -= 7;
++		if (images && tab.iImage >= 0)
++		{
++			int w = 0, h = 0;
++			if (ImageList_GetIconSize(images, &w, &h))
++			{
++				int iconY = tabRect.top + ((tabRect.bottom - tabRect.top) - h) / 2;
++				ImageList_Draw(images, tab.iImage, dc, label.left, iconY, ILD_TRANSPARENT);
++				label.left += w + 6;
++			}
++		}
++		SetTextColor(dc, DARK_FOREGROUND);
++		DrawTextW(dc, title, -1, &label, DT_SINGLELINE | DT_VCENTER
++			| DT_END_ELLIPSIS | DT_NOPREFIX);
++	}
++	if (oldFont)
++	{
++		SelectObject(dc, oldFont);
++	}
 +}
 +
 +void UiTheming::SubclassThemeWindow(HWND hwnd)
@@ -379,6 +532,11 @@ index d62cb32..6047822 100644
 +	{
 +		return;
 +	}
++	// CBT focus notifications can visit the same controls many times.
++	if (std::find(m_themeWindows.begin(), m_themeWindows.end(), hwnd) != m_themeWindows.end())
++	{
++		return;
++	}
 +
 +	if (g_allowDarkModeForWindow)
 +	{
@@ -401,7 +559,13 @@ index d62cb32..6047822 100644
 +	}
 +	else if (IsClass(hwnd, WC_HEADER))
 +	{
-+		SetWindowTheme(hwnd, L"ItemsView", nullptr);
++		SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
++	}
++	else if (IsClass(hwnd, WC_TABCONTROL))
++	{
++		// Windows 11 still paints standard 1.4 tabs in light colors.
++		// WM_PAINT below only replaces drawing, not tab hit-testing/dragging.
++		SetWindowTheme(hwnd, L"", L"");
 +	}
 +	else if (IsClass(hwnd, REBARCLASSNAME))
 +	{
@@ -410,6 +574,9 @@ index d62cb32..6047822 100644
 +	}
 +	else if (IsClass(hwnd, TOOLBARCLASSNAME))
 +	{
++		// Suppress the OS light hover skin; parent NM_CUSTOMDRAW paints
++		// each button and keeps the normal toolbar icons/commands.
++		SetWindowTheme(hwnd, L"", L"");
 +		SendMessage(hwnd, TB_SETINSERTMARKCOLOR, 0, DARK_FOREGROUND);
 +	}
 +	else if (IsClass(hwnd, STATUSCLASSNAME))
@@ -419,11 +586,23 @@ index d62cb32..6047822 100644
 +	}
 +	else if (IsClass(hwnd, WC_COMBOBOX) || IsClass(hwnd, WC_COMBOBOXEX))
 +	{
-+		SetWindowTheme(hwnd, L"CFD", nullptr);
++		SetWindowTheme(hwnd, L"DarkMode_CFD", nullptr);
 +	}
 +	else if (IsClass(hwnd, WC_EDIT))
 +	{
-+		SetWindowTheme(hwnd, L"CFD", nullptr);
++		SetWindowTheme(hwnd, L"DarkMode_CFD", nullptr);
++	}
++	else if (IsClass(hwnd, L"Button") &&
++		(GetWindowLongPtr(hwnd, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX)
++	{
++		// Standard Win32 group boxes otherwise retain a pale border and fill.
++		SetWindowTheme(hwnd, L"", L"");
++	}
++	else if (IsClass(hwnd, L"Button") || IsClass(hwnd, L"ScrollBar")
++		|| IsClass(hwnd, TRACKBAR_CLASS) || IsClass(hwnd, UPDOWN_CLASS)
++		|| IsClass(hwnd, PROGRESS_CLASS))
++	{
++		SetWindowTheme(hwnd, L"DarkMode_Explorer", nullptr);
 +	}
 +	else if (IsClass(hwnd, L"DisplayWindow"))
 +	{
@@ -495,10 +674,12 @@ index d62cb32..6047822 100644
 +		DrawTextW(item->hDC, text, -1, &item->rcItem, flags);
 +		return TRUE;
 +	}
++	case WM_CTLCOLORDLG:
 +	case WM_CTLCOLORSTATIC:
 +	case WM_CTLCOLORBTN:
 +	case WM_CTLCOLOREDIT:
 +	case WM_CTLCOLORLISTBOX:
++	case WM_CTLCOLORSCROLLBAR:
 +	{
 +		HDC dc = reinterpret_cast<HDC>(wParam);
 +		SetTextColor(dc, DARK_FOREGROUND);
@@ -508,7 +689,8 @@ index d62cb32..6047822 100644
 +
 +	case WM_ERASEBKGND:
 +		if (IsClass(hwnd, WC_STATIC) || IsClass(hwnd, REBARCLASSNAME)
-+			|| IsClass(hwnd, TOOLBARCLASSNAME))
++			|| IsClass(hwnd, TOOLBARCLASSNAME) || IsClass(hwnd, WC_TABCONTROL)
++			|| IsClass(hwnd, L"#32770"))
 +		{
 +			RECT rect;
 +			GetClientRect(hwnd, &rect);
@@ -517,27 +699,156 @@ index d62cb32..6047822 100644
 +		}
 +		break;
 +
++	case WM_MOUSEMOVE:
++		if (IsClass(hwnd, WC_TABCONTROL))
++		{
++			TCHITTESTINFO hit = {};
++			hit.pt.x = GET_X_LPARAM(lParam);
++			hit.pt.y = GET_Y_LPARAM(lParam);
++			int index = TabCtrl_HitTest(hwnd, &hit);
++			if (index != self->m_hoverTabIndex)
++			{
++				self->m_hoverTabIndex = index;
++				InvalidateRect(hwnd, nullptr, FALSE);
++			}
++			TRACKMOUSEEVENT track = { sizeof(track), TME_LEAVE, hwnd, 0 };
++			TrackMouseEvent(&track);
++		}
++		break;
++	case WM_MOUSELEAVE:
++		if (IsClass(hwnd, WC_TABCONTROL))
++		{
++			self->m_hoverTabIndex = -1;
++			InvalidateRect(hwnd, nullptr, FALSE);
++		}
++		break;
++	case WM_PAINT:
++		if (IsClass(hwnd, L"Button") &&
++			(GetWindowLongPtr(hwnd, GWL_STYLE) & BS_TYPEMASK) == BS_GROUPBOX)
++		{
++			PAINTSTRUCT ps = {};
++			HDC dc = BeginPaint(hwnd, &ps);
++			if (dc)
++			{
++				RECT bounds = {};
++				GetClientRect(hwnd, &bounds);
++				FillRect(dc, &bounds, self->m_darkBackgroundBrush);
++				RECT outline = bounds;
++				outline.top += 8;
++				outline.bottom -= 1;
++				HPEN pen = CreatePen(PS_SOLID, 1, DARK_BORDER);
++				HGDIOBJ oldPen = SelectObject(dc, pen);
++				HGDIOBJ oldBrush = SelectObject(dc, GetStockObject(NULL_BRUSH));
++				Rectangle(dc, outline.left + 1, outline.top, outline.right - 1, outline.bottom);
++				SelectObject(dc, oldBrush);
++				SelectObject(dc, oldPen);
++				DeleteObject(pen);
++				WCHAR label[260] = {};
++				GetWindowTextW(hwnd, label, static_cast<int>(_countof(label)));
++				HFONT font = reinterpret_cast<HFONT>(SendMessage(hwnd, WM_GETFONT, 0, 0));
++				HGDIOBJ oldFont = font ? SelectObject(dc, font) : nullptr;
++				SetTextColor(dc, DARK_FOREGROUND);
++				SetBkMode(dc, OPAQUE);
++				SetBkColor(dc, DARK_BACKGROUND);
++				RECT title = bounds;
++				title.left += 11;
++				title.right -= 8;
++				title.bottom = title.top + 18;
++				DrawTextW(dc, label, -1, &title, DT_LEFT | DT_SINGLELINE | DT_NOPREFIX);
++				if (oldFont) { SelectObject(dc, oldFont); }
++				EndPaint(hwnd, &ps);
++			}
++			return 0;
++		}
++		if (IsClass(hwnd, WC_TABCONTROL))
++		{
++			PAINTSTRUCT ps = {};
++			HDC dc = BeginPaint(hwnd, &ps);
++			if (dc)
++			{
++				self->PaintDarkTabs(hwnd, dc);
++				EndPaint(hwnd, &ps);
++			}
++			return 0;
++		}
++		break;
++
 +	case WM_NOTIFY:
 +	{
 +		const auto *header = reinterpret_cast<const NMHDR *>(lParam);
-+		if (!header || header->code != NM_CUSTOMDRAW
-+			|| !IsClass(header->hwndFrom, TOOLBARCLASSNAME))
++		if (!header || header->code != NM_CUSTOMDRAW)
 +		{
 +			break;
 +		}
-+
-+		auto *draw = reinterpret_cast<NMTBCUSTOMDRAW *>(lParam);
-+		if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
++		if (IsClass(header->hwndFrom, TOOLBARCLASSNAME))
 +		{
-+			return CDRF_NOTIFYITEMDRAW;
++			auto *draw = reinterpret_cast<NMTBCUSTOMDRAW *>(lParam);
++			if (draw->nmcd.dwDrawStage == CDDS_PREPAINT)
++			{
++				return CDRF_NOTIFYITEMDRAW;
++			}
++			if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
++			{
++				const bool hovered = (draw->nmcd.uItemState & (CDIS_HOT | CDIS_SELECTED)) != 0;
++				FillRect(draw->nmcd.hdc, &draw->nmcd.rc,
++					hovered ? self->m_darkHoverBrush : self->m_darkBackgroundBrush);
++				draw->clrText = DARK_FOREGROUND;
++				draw->clrBtnFace = DARK_PANEL;
++				draw->clrHighlightHotTrack = DARK_HOVER;
++				draw->clrTextHighlight = DARK_FOREGROUND;
++				return TBCDRF_USECDCOLORS | TBCDRF_NOBACKGROUND
++					| TBCDRF_NOEDGES | TBCDRF_NOOFFSET;
++			}
 +		}
-+		if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT)
++		else if (IsClass(header->hwndFrom, WC_HEADER))
 +		{
-+			draw->clrText = DARK_FOREGROUND;
-+			draw->clrBtnFace = DARK_PANEL;
-+			draw->clrHighlightHotTrack = DARK_HOVER;
-+			draw->clrTextHighlight = DARK_FOREGROUND;
-+			return TBCDRF_USECDCOLORS;
++			auto *draw = reinterpret_cast<NMCUSTOMDRAW *>(lParam);
++			if (draw->dwDrawStage == CDDS_PREPAINT)
++			{
++				return CDRF_NOTIFYITEMDRAW;
++			}
++			if (draw->dwDrawStage == CDDS_ITEMPREPAINT)
++			{
++				FillRect(draw->hdc, &draw->rc, self->m_darkHoverBrush);
++				WCHAR title[260] = {};
++				HDITEMW item = {};
++				item.mask = HDI_TEXT | HDI_FORMAT;
++				item.pszText = title;
++				item.cchTextMax = static_cast<int>(_countof(title));
++				Header_GetItem(header->hwndFrom, static_cast<int>(draw->dwItemSpec), &item);
++				RECT label = draw->rc;
++				label.left += 8;
++				label.right -= 8;
++				if (item.fmt & (HDF_SORTUP | HDF_SORTDOWN))
++				{
++					label.right -= 13;
++					const int x = draw->rc.right - 13;
++					const int y = (draw->rc.top + draw->rc.bottom) / 2;
++					HPEN pen = CreatePen(PS_SOLID, 1, DARK_FOREGROUND);
++					HGDIOBJ oldPen = SelectObject(draw->hdc, pen);
++					if (item.fmt & HDF_SORTUP)
++					{
++						MoveToEx(draw->hdc, x - 3, y + 2, nullptr);
++						LineTo(draw->hdc, x, y - 2);
++						LineTo(draw->hdc, x + 3, y + 2);
++					}
++					else
++					{
++						MoveToEx(draw->hdc, x - 3, y - 2, nullptr);
++						LineTo(draw->hdc, x, y + 2);
++						LineTo(draw->hdc, x + 3, y - 2);
++					}
++					SelectObject(draw->hdc, oldPen);
++					DeleteObject(pen);
++				}
++				SetBkMode(draw->hdc, TRANSPARENT);
++				SetTextColor(draw->hdc, DARK_FOREGROUND);
++				UINT align = (item.fmt & HDF_RIGHT) ? DT_RIGHT
++					: ((item.fmt & HDF_CENTER) ? DT_CENTER : DT_LEFT);
++				DrawTextW(draw->hdc, title, -1, &label,
++					DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | align);
++				return CDRF_SKIPDEFAULT;
++			}
 +		}
 +		break;
 +	}
@@ -553,10 +864,10 @@ index d62cb32..6047822 100644
 +	return DefSubclassProc(hwnd, msg, wParam, lParam);
 +}
 diff --git a/Explorer++/Explorer++/UiTheming.h b/Explorer++/Explorer++/UiTheming.h
-index 5f56242..3dd6cd5 100644
+index 5f56242..c001b34 100644
 --- a/Explorer++/Explorer++/UiTheming.h
 +++ b/Explorer++/Explorer++/UiTheming.h
-@@ -1,37 +1,50 @@
+@@ -1,37 +1,56 @@
 -// Copyright (C) Explorer++ Project
 -// SPDX-License-Identifier: GPL-3.0-only
 -// See LICENSE in the top level directory
@@ -623,6 +934,9 @@ index 5f56242..3dd6cd5 100644
 +	void InitializeDarkAppearance();
 +	void ApplyDarkAppearanceToWindow(HWND hwnd);
 +	void SubclassThemeWindow(HWND hwnd);
++	void ThemeOwnedDialog(HWND hwnd);
++	void PaintDarkTabs(HWND hwnd, HDC dc);
++	static LRESULT CALLBACK DialogCbtHook(int code, WPARAM wParam, LPARAM lParam);
 +	static BOOL CALLBACK EnumChildThemeProc(HWND hwnd, LPARAM data);
 +	static LRESULT CALLBACK ThemeWindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam,
 +		UINT_PTR subclassId, DWORD_PTR data);
@@ -641,6 +955,9 @@ index 5f56242..3dd6cd5 100644
 +
 +	HBRUSH m_darkBackgroundBrush = nullptr;
 +	HBRUSH m_darkHoverBrush = nullptr;
++	HHOOK m_dialogHook = nullptr;
++	int m_hoverTabIndex = -1;
++	bool m_inThemeTraversal = false;
 +	std::vector<HWND> m_themeWindows;
  };
 \ No newline at end of file
